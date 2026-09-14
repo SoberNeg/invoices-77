@@ -35,7 +35,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-APP_TITLE = "Прототип OCR счетов v4.9"
+APP_TITLE = "Прототип OCR счетов v5.1"
 
 MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
@@ -85,79 +85,58 @@ def normalize_date(s: str) -> str:
 
 
 def company_name(s: str) -> str:
-    """Нормализует название организации без ИНН/КПП/адреса."""
-    s = clean(s)
-    s = s.replace("«", '"').replace("»", '"')
+    """Нормализует название организации/ИП без ИНН, КПП и адреса."""
+    s = clean(s).replace("«", '"').replace("»", '"')
 
-    # Полные организационно-правовые формы -> короткие.
     s = re.sub(
         r"\bОБЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТЬЮ\b",
-        "ООО",
-        s,
-        flags=re.I,
-    )
-    s = re.sub(
-        r"\bОбщество\s+с\s+Ограниченной\s+Ответственностью\b",
-        "ООО",
-        s,
-        flags=re.I,
+        "ООО", s, flags=re.I
     )
     s = re.sub(
         r"\bОбщество\s+с\s+ограниченной\s+ответственностью\b",
-        "ООО",
-        s,
-        flags=re.I,
+        "ООО", s, flags=re.I
+    )
+    s = re.sub(
+        r"\bИндивидуальный\s+предприниматель\b",
+        "ИП", s, flags=re.I
     )
 
-    # Убираем лидирующие реквизиты.
+    # Реквизиты до названия.
     s = re.sub(r"^ИНН[: ]*\d+[,\s]*", "", s, flags=re.I)
     s = re.sub(r"^КПП[: ]*\d+[,\s]*", "", s, flags=re.I)
     s = re.sub(
         r"^ИНН\s+\d+[,\s]+КПП\s+\d+[,\s]+",
-        "",
-        s,
-        flags=re.I,
+        "", s, flags=re.I
     )
 
     patterns = [
         r'(ИП\s+[А-ЯЁA-Z][^,;\n]+)',
-        r'(ООО\s*"[^"]+")',
-        r'(ООО\s+[А-ЯЁA-Z][^,;\n]+)',
-        r'(АО\s*"[^"]+")',
-        r'(АО\s+[А-ЯЁA-Z][^,;\n]+)',
+        r'(ООО\s+(?:ТД\s+)?\"[^\"]+\")',
+        r'(ООО\s+[А-ЯЁA-Z0-9][^,;\n]+)',
+        r'(АО\s+\"[^\"]+\")',
+        r'(АО\s+[А-ЯЁA-Z0-9][^,;\n]+)',
         r'(Интернет Решения,\s*ООО)',
+        r'(П10\s+РУ\s+ООО)',
     ]
-
     for p in patterns:
         m = re.search(p, s, flags=re.I)
         if m:
-            return clean(m.group(1))
+            return clean(m.group(1)).strip(" ,;:")
 
-    # fallback: берем до реквизитов/адреса.
     s = re.split(
         r",?\s+(?:ИНН|КПП|\d{6},|г\.|ул\.|пр-кт|дом\s|тел\.)",
-        s,
-        maxsplit=1,
-        flags=re.I,
+        s, maxsplit=1, flags=re.I
     )[0]
     return clean(s).strip(" ,;:")
 
 def extract_meta(text: str) -> dict:
-    """
-    Извлекает:
-    Покупатель / Поставщик / Дата / № счета.
-
-    Поддерживает разные названия полей:
-    Поставщик, Получатель, Покупатель, Плательщик,
-    Счет на оплату, Счет-Оферта.
-    """
+    """Извлекает покупателя, поставщика, дату и номер счета."""
     flat = clean(text)
     lines = [clean(x) for x in text.splitlines() if clean(x)]
 
     invoice = ""
     date = ""
 
-    # Номер и дата.
     invoice_patterns = [
         r'(?:Счет|Счёт|СЧЕТ)(?:-Оферта)?(?:\s+на\s+оплату)?\s*№\s*'
         r'([A-Za-zА-Яа-яЁё0-9._/-]+)\s+от\s+'
@@ -172,36 +151,58 @@ def extract_meta(text: str) -> dict:
             date = normalize_date(m.group(2))
             break
 
-    buyer = ""
-    supplier = ""
+    def after_label(labels, reject=""):
+        for i, line in enumerate(lines):
+            low = line.lower()
+            if any(low.startswith(lbl) for lbl in labels):
+                # Значение может быть на той же строке.
+                raw = re.sub(
+                    r"^(?:Поставщик|Покупатель|Плательщик|Получатель)"
+                    r"(?:\s*\([^)]*\))?\s*:?\s*",
+                    "", line, flags=re.I
+                )
+                candidates = []
+                if raw and raw.lower() not in {"поставщик", "покупатель", "плательщик", "получатель"}:
+                    candidates.append(raw)
+                candidates.extend(lines[i + 1:i + 7])
 
-    # 1) Поставщик по явной метке.
-    for i, line in enumerate(lines):
-        if re.match(r"^Поставщик\s*:", line, flags=re.I):
-            raw = re.sub(r"^Поставщик\s*:\s*", "", line, flags=re.I)
+                # Склеиваем соседние строки, если юр. название разорвано переносом.
+                # Для строки с незакрытой кавычкой сначала пробуем склеенный вариант.
+                joined = []
+                for j, c in enumerate(candidates):
+                    if j + 1 < len(candidates) and c.count('"') % 2 == 1:
+                        joined.append(c + " " + candidates[j + 1])
+                    joined.append(c)
+                    if j + 1 < len(candidates) and c.count('"') % 2 == 0:
+                        joined.append(c + " " + candidates[j + 1])
 
-            # PDF может разорвать название внутри кавычек:
-            # Общество ... "Тайле
-            # Рус", 127410, ...
-            if raw.count('"') % 2 == 1 and i + 1 < len(lines):
-                raw = raw + " " + lines[i + 1]
+                for c in joined:
+                    if reject and reject.lower() in c.lower():
+                        continue
+                    if (
+                        re.search(r"\b(?:ООО|АО|ИП)\b", c, flags=re.I)
+                        or re.search(r"Общество\s+с\s+ограниченной\s+ответственностью", c, flags=re.I)
+                        or re.search(r"Индивидуальный\s+предприниматель", c, flags=re.I)
+                        or "Интернет Решения" in c
+                        or re.search(r"\bП10\s+РУ\s+ООО\b", c, flags=re.I)
+                    ):
+                        name = company_name(c)
+                        if name and "банк" not in name.lower():
+                            return name
+        return ""
 
-            if raw:
-                supplier = company_name(raw)
+    supplier = after_label(["поставщик"])
 
-            if not supplier and i + 1 < len(lines):
-                supplier = company_name(lines[i + 1])
-            if supplier:
-                break
-
-    # 2) Если нет "Поставщик:", ищем "Получатель".
-    # У Ozon название "Интернет Решения, ООО" находится непосредственно рядом с "Получатель".
+    # Если поставщика нет, ищем получателя в банковском блоке.
     if not supplier:
         for i, line in enumerate(lines):
             if line.lower() == "получатель":
-                candidates = lines[max(0, i - 3):i + 4]
-                for c in candidates:
-                    if re.search(r"\b(?:ООО|АО|ИП)\b", c, flags=re.I) or "Интернет Решения" in c:
+                for c in lines[max(0, i - 4):i + 5]:
+                    if (
+                        re.search(r"\b(?:ООО|АО|ИП)\b", c, flags=re.I)
+                        or re.search(r"Общество\s+с\s+ограниченной\s+ответственностью", c, flags=re.I)
+                        or re.search(r"Индивидуальный\s+предприниматель", c, flags=re.I)
+                    ):
                         name = company_name(c)
                         if name and "банк" not in name.lower():
                             supplier = name
@@ -209,45 +210,30 @@ def extract_meta(text: str) -> dict:
                 if supplier:
                     break
 
-    # 3) Покупатель / Плательщик.
-    for i, line in enumerate(lines):
-        if re.match(r"^(?:Покупатель|Плательщик)\s*:", line, flags=re.I):
-            raw = re.sub(r"^(?:Покупатель|Плательщик)\s*:\s*", "", line, flags=re.I)
+    buyer = after_label(["покупатель", "плательщик"], reject=supplier)
 
-            if raw:
-                buyer = company_name(raw)
-
-            # В некоторых PDF значение находится на следующей строке
-            # или существенно ниже после служебного текста.
-            if not buyer:
-                for candidate in lines[i + 1:i + 20]:
-                    if (
-                        re.search(r"\b(?:ООО|АО|ИП)\b", candidate, flags=re.I)
-                        or re.search(r"ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ", candidate, flags=re.I)
-                    ):
-                        name = company_name(candidate)
-                        if name and clean(name).lower() != clean(supplier).lower():
-                            buyer = name
-                            break
-            break
-
-    # 4) Универсальные fallback'и.
+    # Универсальные fallback'и.
     if not supplier and "Интернет Решения" in flat:
         supplier = "Интернет Решения, ООО"
 
     if not buyer:
-        for candidate in lines:
+        orgs = []
+        for line in lines:
             if (
-                re.search(r"\bИНН\b", candidate, flags=re.I)
+                re.search(r"\bИНН\b", line, flags=re.I)
                 and (
-                    re.search(r"\b(?:ООО|АО|ИП)\b", candidate, flags=re.I)
-                    or re.search(r"ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ", candidate, flags=re.I)
+                    re.search(r"\b(?:ООО|АО|ИП)\b", line, flags=re.I)
+                    or re.search(r"Общество\s+с\s+ограниченной\s+ответственностью", line, flags=re.I)
+                    or re.search(r"Индивидуальный\s+предприниматель", line, flags=re.I)
                 )
             ):
-                name = company_name(candidate)
-                if name and clean(name).lower() != clean(supplier).lower():
-                    buyer = name
-                    break
+                name = company_name(line)
+                if name and "банк" not in name.lower():
+                    orgs.append(name)
+        for name in orgs:
+            if clean(name).lower() != clean(supplier).lower():
+                buyer = name
+                break
 
     return {
         "buyer": buyer,
@@ -266,11 +252,11 @@ def extract_pdf_text(path: Path) -> str:
     return "\n".join(page.get_text("text") for page in doc)
 
 
-def extract_pdf_text_with_ocr(path: Path) -> str:
+def extract_pdf_text_with_ocr(path: Path, force: bool = False) -> str:
     text = extract_pdf_text(path)
 
-    # Если в PDF есть нормальный текстовый слой — OCR не нужен.
-    if len(re.findall(r"[A-Za-zА-Яа-яЁё]", text)) > 100:
+    # Если в PDF есть нормальный текстовый слой — OCR не нужен, кроме force=True.
+    if not force and len(re.findall(r"[A-Za-zА-Яа-яЁё]", text)) > 100:
         return text
 
     try:
@@ -333,7 +319,7 @@ def extract_items_vertical_table(text: str) -> list[tuple[str, str]]:
     """
     pattern = re.compile(
         r"(?:^|\n)\s*(\d+(?:[.,]\d+)?)\s*\n"
-        r"\s*(?:шт\.?|pcs\.?)\s*\n"
+        r"\s*(?:шт\.?|pcs\.?|уп\.?|упак\.?)\s*\n"
         r"\s*(.+?)\s*\n"
         r"\s*(\d{1,4})\s*\n"
         r"\s*([A-Za-zА-Яа-яЁё0-9._/-]{3,})\s*(?=\n|$)",
@@ -506,14 +492,197 @@ def extract_items_ozon(text: str) -> list[tuple[str, str]]:
 
     return rows
 
-def parse_pdf(path: Path) -> list[RowData]:
-    text = extract_pdf_text_with_ocr(path)
-    meta = extract_meta(text)
-    low = text.lower()
 
+TABLE_UNITS_RE = (
+    r"(?:шт\.?|pcs\.?|м2|м²|м|пог\.?\s*м|куб\.?\s*м|рул\.?|"
+    r"упак\.?|уп\.?|компл\.?|кг|л|пач\.?)"
+)
+
+def _is_probable_code_line(s: str) -> bool:
+    s = clean(s)
+    if not s or len(s) > 45:
+        return False
+    if re.search(r"[А-Яа-яЁё]{4,}", s):
+        return False
+    return bool(re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9._/-]+", s))
+
+
+def extract_items_sequential_table(text: str) -> list[tuple[str, str]]:
+    """
+    Универсальный парсер типовых российских счетов.
+    Работает с PDF, где PyMuPDF читает таблицу последовательностью:
+    № -> наименование -> количество/единица -> цена -> сумма.
+    Поддерживает многострочные наименования, артикулы и колонки НДС.
+    """
+    lines = [clean(x) for x in text.splitlines() if clean(x)]
+    if not lines:
+        return []
+
+    header_keys = (
+        "товары (работы, услуги)",
+        "наименование товара",
+        "название товара или услуги",
+        "товар (услуга)",
+    )
+    header_positions = [
+        i for i, x in enumerate(lines)
+        if any(k in x.lower() for k in header_keys)
+    ]
+    start = header_positions[0] + 1 if header_positions else 0
+
+    end = next(
+        (
+            i for i in range(start, len(lines))
+            if re.match(
+                r"^(?:Итого|Всего\s+к\s+оплате|Всего\s+наименований)",
+                lines[i], flags=re.I
+            )
+        ),
+        len(lines),
+    )
+    block = lines[start:end]
+
+    qty_num = r"\d[\d ]*(?:[.,]\d+)?"
+    rows = []
+    expected = 1
+    i = 0
+
+    while i < len(block):
+        line = block[i]
+        item_first = ""
+
+        if line == str(expected):
+            pass
+        else:
+            m_inline = re.match(r"^(\d{1,3})\s+(.+)$", line)
+            if not (m_inline and int(m_inline.group(1)) == expected):
+                i += 1
+                continue
+            item_first = clean(m_inline.group(2))
+
+        name_parts = [item_first] if item_first else []
+        qty = ""
+        qty_idx = -1
+
+        j = i + 1
+        while j < len(block) and j <= i + 24:
+            x = block[j]
+
+            m_same = re.fullmatch(
+                rf"({qty_num})\s+({TABLE_UNITS_RE})",
+                x, flags=re.I
+            )
+            if m_same:
+                qty = clean(m_same.group(1)).replace(" ", "").replace(",", ".")
+                qty_idx = j
+                break
+
+            if re.fullmatch(qty_num, x):
+                if j + 1 < len(block) and re.fullmatch(TABLE_UNITS_RE, block[j + 1], flags=re.I):
+                    qty = x.replace(" ", "").replace(",", ".")
+                    qty_idx = j
+                    break
+
+            # Только после проверки количества проверяем начало следующей позиции.
+            next_inline = re.match(r"^(\d{1,3})\s+(.+)$", x)
+            if qty_idx < 0 and (
+                x == str(expected + 1)
+                or (next_inline and int(next_inline.group(1)) == expected + 1)
+            ):
+                break
+
+            name_parts.append(x)
+            j += 1
+
+        if not qty:
+            i += 1
+            continue
+
+        cleaned = []
+        for x in name_parts:
+            if not x:
+                continue
+            low = x.lower()
+            if low in {
+                "№", "артикул", "товар", "товары (работы, услуги)",
+                "кол-во", "количество", "ед.", "ед", "ед.изм", "ед. изм.",
+                "цена", "сумма", "код", "ставка", "ндс", "сумма ндс",
+                "без ндс"
+            }:
+                continue
+            if re.fullmatch(r"\d{1,3}", x):
+                continue
+            if re.fullmatch(r"\d[\d ]*[,.]\d{2}\s*₽?", x):
+                continue
+            if re.fullmatch(r"(?:Без\s+НДС|\d{1,2}%?)", x, flags=re.I):
+                continue
+            # Отдельный артикул/код не добавляем к наименованию.
+            if _is_probable_code_line(x) and len(name_parts) > 1:
+                continue
+            cleaned.append(x)
+
+        name = clean(" ".join(cleaned))
+        if name:
+            rows.append((name, qty))
+            expected += 1
+            i = qty_idx + 1
+        else:
+            i += 1
+
+    return rows
+
+
+def merge_text_and_ocr(path: Path, text: str, meta: dict) -> tuple[str, dict]:
+    """
+    Если PDF является сканом ИЛИ текстовый слой потерял важные реквизиты,
+    добавляем OCR-текст и повторно извлекаем метаданные.
+    """
+    letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", text))
+    need_ocr = letters < 100 or not meta.get("buyer") or not meta.get("supplier")
+
+    if not need_ocr:
+        return text, meta
+
+    try:
+        ocr_text = extract_pdf_text_with_ocr(path)
+    except Exception:
+        return text, meta
+
+    # extract_pdf_text_with_ocr для нормального текстового PDF может вернуть тот же текст.
+    # Поэтому отдельно OCR принудительно делаем только если текста почти нет.
+    if letters >= 100 and ocr_text == text:
+        return text, meta
+
+    combined = text + "\n" + ocr_text
+    return combined, extract_meta(combined)
+
+def parse_pdf(path: Path) -> list[RowData]:
+    text = extract_pdf_text(path)
+    meta = extract_meta(text)
+    letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", text))
+
+    # Для сканов OCR обязателен.
+    if letters < 100:
+        text = extract_pdf_text_with_ocr(path, force=True)
+        meta = extract_meta(text)
+    # Для некоторых PDF текстовый слой содержит таблицу, но не содержит
+    # покупателя/поставщика (например, часть текста сохранена как изображение).
+    elif not meta.get("buyer") or not meta.get("supplier"):
+        try:
+            ocr_text = extract_pdf_text_with_ocr(path, force=True)
+            combined = text + "\n" + ocr_text
+            ocr_meta = extract_meta(combined)
+            if ocr_meta.get("buyer"):
+                meta["buyer"] = ocr_meta["buyer"]
+            if ocr_meta.get("supplier"):
+                meta["supplier"] = ocr_meta["supplier"]
+        except Exception:
+            pass
+
+    low = text.lower()
     items = []
 
-    # Сначала определяем известный макет документа.
+    # Специализированные макеты.
     if "мухамеджанов" in low or "ledcapital" in low:
         items = extract_items_ledcapital(text)
     elif "тайле рус" in low:
@@ -523,10 +692,13 @@ def parse_pdf(path: Path) -> list[RowData]:
     elif "инструменты на горской" in low:
         items = extract_items_vertical_table(text)
 
-    # Универсальные fallback'и.
+    # Новый универсальный парсер типовых счетов.
+    if not items:
+        items = extract_items_sequential_table(text)
+
+    # Старые fallback'и.
     if not items:
         items = extract_items_generic(text)
-
     if not items:
         items = extract_items_vertical_table(text)
 
