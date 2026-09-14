@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE v5.1
 
 on:
   workflow_dispatch:
@@ -29,11 +29,11 @@ jobs:
       - name: Build Windows application
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onedir --name OCR_Invoice_Table --collect-all tkinterdnd2 --collect-all paddleocr --collect-all paddle ocr_invoice_table.py
+          pyinstaller --noconfirm --clean --windowed --onedir --name OCR_Invoice_Table_v5_1 --collect-all tkinterdnd2 --collect-all paddleocr --collect-all paddle ocr_invoice_table.py
 
-      - name: Upload Windows EXE
+      - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: OCR_Invoice_Table-Windows
-          path: dist/OCR_Invoice_Table/
+          name: OCR_Invoice_Table_v5_1-Windows
+          path: dist/OCR_Invoice_Table_v5_1/
           if-no-files-found: error
