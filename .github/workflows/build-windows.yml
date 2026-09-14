@@ -1,0 +1,39 @@
+name: Build Windows EXE v5.1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build Windows application
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --name OCR_Invoice_Table_v5_1 --collect-all tkinterdnd2 --collect-all paddleocr --collect-all paddle ocr_invoice_table.py
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: OCR_Invoice_Table_v5_1-Windows
+          path: dist/OCR_Invoice_Table_v5_1/
+          if-no-files-found: error
